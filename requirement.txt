@@ -1,0 +1,9 @@
+einops
+numpy
+utils
+prettytable
+pandas
+matplotlib
+tensorboard
+scipy
+timm
