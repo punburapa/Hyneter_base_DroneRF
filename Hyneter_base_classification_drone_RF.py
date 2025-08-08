@@ -503,9 +503,9 @@ from torchvision.datasets.folder import default_loader
 from torchvision import transforms
 import random
 from torchvision.transforms import v2
-from torch.utils.data import DataLoader, TensorDataset
+from torchvision.datasets import ImageFolder
+from torch.utils.data import DataLoader, TensorDataset, random_split
 import torch.optim as optim
-import timm
 import time
 import os
 
@@ -519,8 +519,8 @@ LEARNING_RATE = 0.001
 WEIGHT_DECAY = 0.05
 WARMUP_EPOCHS = 20
 NUM_WORKERS = 8  # Number of workers for DataLoader
-NUM_CLASSES = 1000  # Number of classes in ImageNet1K
-DATA_DIR = 'imagenet'  # Update with your ImageNet dataset path
+NUM_CLASSES = 4
+DATA_DIR = 'DroneRF'  # Update with your ImageNet dataset path
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -528,13 +528,6 @@ print(f"Training for {NUM_EPOCHS} epochs with batch size {BATCH_SIZE} and learni
       f"\nImage size: {IMAGE_SIZE}, Weight decay: {WEIGHT_DECAY}, Warmup epochs: {WARMUP_EPOCHS}, "
       f"Number of workers: {NUM_WORKERS}, Number of classes: {NUM_CLASSES}")
 
-
-# --- Augmentation-specific hyperparameters ---
-RAND_AUGMENT_NUM_OPS = 2
-RAND_AUGMENT_MAGNITUDE = 9
-MIXUP_ALPHA = 0.8
-CUTMIX_ALPHA = 1.0
-RANDOM_ERASING_PROB = 0.25
 
 model = Hyneter(hidden_dim=96, Conv_layers=(2, 2, 2, 2), TB_layers=(2, 2, 2, 2), heads=(3, 6, 12, 24), num_classes=NUM_CLASSES)
 print("---------Hyneter Base model initialized----------")
@@ -547,155 +540,110 @@ print(f"Using device: {device}")
 print(f"Model is on device: {next(model.parameters()).device}")
 
 
-criterion  = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=WARMUP_EPOCHS)
-scaler = torch.GradScaler()
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=0.001, momentum=0.9)
+
 print("Optimizer and scheduler initialized with learning rate:", LEARNING_RATE, "and weight decay:", WEIGHT_DECAY)
 
 
-
-# --- Data Transformations with timm's built-in options ---
-train_transform = timm.data.create_transform(
-    input_size=IMAGE_SIZE,
-    is_training=True,
-    color_jitter=0.4,
-    auto_augment=f'rand-n{RAND_AUGMENT_NUM_OPS}-m{RAND_AUGMENT_MAGNITUDE}',
-    interpolation='bicubic',
-    mean=(0.485, 0.456, 0.406),
-    std=(0.229, 0.224, 0.225),
-    re_prob=RANDOM_ERASING_PROB,
-    re_mode='pixel',
-    re_count=1,
-)
-
-val_transform = transforms.Compose([
+transform = transforms.Compose([
     transforms.Resize(224),
-    transforms.CenterCrop(IMAGE_SIZE),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.ToTensor()
 ])
+
 
 print("--- Data transformations initialized ---")
 print("--- Loade Dataset ---")
-train_dataset = ImageNet(root=DATA_DIR, split='train', transform=train_transform)
-val_dataset = ImageNet(root=DATA_DIR, split='val', transform=val_transform)
+dataset = ImageFolder(root=DATA_DIR, split='train', transform=transform)
+
+total_size = len(dataset)
+train_size = int(0.7 * total_size)
+val_size = int(0.1 * total_size)
+test_size = total_size - train_size - val_size
+NUM_CLASSES = len(dataset.classes)
+print(f"Total dataset size: {total_size}, Train size: {train_size}, Validation size: {val_size}, Test size: {test_size}")
+
+# Split dataset
+generator = torch.Generator().manual_seed(42)
+train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size], generator=generator)
+
+
 print(f"Train dataset size: {len(train_dataset)}, Validation dataset size: {len(val_dataset)}")
 
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+val_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 print(f"Train DataLoader created with batch size {BATCH_SIZE} and {NUM_WORKERS} workers")
-
-
-from timm.data import Mixup
-
-mixup_fn = None
-if MIXUP_ALPHA > 0 or CUTMIX_ALPHA > 0:
-    mixup_fn = Mixup(
-        mixup_alpha=MIXUP_ALPHA,
-        cutmix_alpha=CUTMIX_ALPHA,
-        num_classes=NUM_CLASSES,
-        prob=1.0,
-        switch_prob=0.5,
-        mode='batch',
-        label_smoothing=0.1,
-    )
 
 
 CHECKPOINT_DIR = './checkpoints' # Directory to save checkpoints
 os.makedirs(CHECKPOINT_DIR, exist_ok=True) # Create the directory if it doesn't exist
 
 
-best_accuracy = 0.0
-
 print("Starting training...")
 
-
-for epoch in range(NUM_EPOCHS):
-    epoch_start_time = time.time()
-    print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} started at: {time.ctime(epoch_start_time)}")
-
-    model.train()
-    running_loss = 0.0
-
-
-    for batch_idx, (inputs, labels) in enumerate(train_loader):
-        inputs, labels = inputs.to(device), labels.to(device)
-
-        # if mixup_fn is not None:
-        #     inputs, labels = mixup_fn(inputs, labels)
-
-        optimizer.zero_grad()
-
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            outputs = model(inputs)
+def train_model(model, train_loader, val_loader, epochs=5):
+    start_time = time.time()
+    for epoch in range(epochs):
+        # --- Train ---
+        model.train()
+        running_loss, correct, total = 0.0, 0, 0
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
             loss = criterion(outputs, labels)
-        
-        # loss.backward()
-        # optimizer.step()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
+            loss.backward()
+            optimizer.step()
 
-        scaler.update()
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-        running_loss += loss.item() * inputs.size(0)
+        train_acc = 100 * correct / total
 
-        if (batch_idx + 1) % 100 == 0:
-            print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Batch [{batch_idx+1}/{len(train_loader)}], "
-                  f"Loss: {loss.item():.4f}")
+        # --- Validate ---
+        model.eval()
+        val_loss, val_correct, val_total = 0.0, 0, 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
 
-    epoch_train_loss = running_loss / len(train_dataset) # Approximate for mixed samples
-    print(f"Epoch {epoch+1} Train Loss: {epoch_train_loss:.4f}")
+        val_acc = 100 * val_correct / val_total
 
-    scheduler.step()
+        print(f"Epoch [{epoch+1}/{epochs}] "
+              f"Train Loss: {running_loss/len(train_loader):.4f}, Train Acc: {train_acc:.2f}% "
+              f"Val Loss: {val_loss/len(val_loader):.4f}, Val Acc: {val_acc:.2f}%")
 
-    # --- Validation Phase ---
+    end_time = time.time()
+    print(f"Training finished in {end_time - start_time:.2f} seconds")
+
+def test_model(model, test_loader):
     model.eval()
-    val_running_loss = 0.0
-    val_correct_predictions = 0
-    val_total_samples = 0
-
+    correct, total = 0, 0
     with torch.no_grad():
-        for inputs, labels in val_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)  # Top-1 prediction
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-            val_running_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs.data, 1)
-            val_total_samples += labels.size(0)
-            val_correct_predictions += (predicted == labels).sum().item()
-
-    val_loss = val_running_loss / len(val_dataset)
-    val_accuracy = val_correct_predictions / val_total_samples
-    print(f"Epoch {epoch+1} Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
-
-    # Record epoch end time and calculate duration
-    epoch_end_time = time.time()
-    epoch_duration = epoch_end_time - epoch_start_time
-    print(f"Epoch {epoch+1} ended at: {time.ctime(epoch_end_time)}")
-    print(f"Epoch {epoch+1} duration: {epoch_duration:.2f} seconds")
-
-    # Save checkpoint
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, f'epoch_{epoch+1:03d}.pth')
-    torch.save({
-        'epoch': epoch + 1,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(), # Save scheduler state too
-        'best_accuracy': best_accuracy, # Or current accuracy if you want to track more
-        'val_accuracy': val_accuracy,
-        'val_loss': val_loss,
-        'train_loss': epoch_train_loss,
-    }, checkpoint_path)
-    print(f"Saved checkpoint to {checkpoint_path}")
+    top1_acc = 100 * correct / total
+    print(f"Top-1 Accuracy on Test Set: {top1_acc:.2f}%")
 
 
-    # Save the best model
-    if val_accuracy > best_accuracy:
-        best_accuracy = val_accuracy
-        torch.save(model.state_dict(), f'custom_imagenet_best_model.pth')
-        print(f"Saved best model with accuracy: {best_accuracy:.4f}")
-
-print("\nTraining finished :D (I wish)")
+# ========================
+# 5. RUN TRAINING
+# ========================
+train_model(model, train_loader, val_loader, epochs=NUM_EPOCHS)
+print("\n\n\n")
+test_model(model, test_loader)
